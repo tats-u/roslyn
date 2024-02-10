@@ -642,6 +642,9 @@ namespace Microsoft.CodeAnalysis
         System_Collections_Immutable_ImmutableArray_T__AsSpan,
         System_Collections_Generic_List_T__AddRange,
 
+        System_String__IsNullOrEmptyString,
+        System_String__CompareOrdinalStringString,
+
         Count,
 
         // Remember to update the AllWellKnownTypeMembers tests when making changes here

@@ -3,6 +3,7 @@
 ' See the LICENSE file in the project root for more information.
 
 Imports System.Collections.Immutable
+Imports System.Linq.Expressions
 Imports Microsoft.CodeAnalysis.PooledObjects
 Imports Microsoft.CodeAnalysis.VisualBasic.Symbols
 
@@ -679,6 +680,24 @@ Namespace Microsoft.CodeAnalysis.VisualBasic
             Dim right As BoundExpression = node.Right
             Dim compareText As Boolean = (node.OperatorKind And BinaryOperatorKind.CompareText) <> 0
 
+            ' If either operand is constant, we may be able to generate more efficient code without VB runtime.
+            If IsOperandNullOrEmptyConstantLike(right, compareText) Then
+                Dim useIsNullOrEmpty = TryRewriteStringVersusNullOrEmptyComparisonOperator(node, left, node.OperatorKind And BinaryOperatorKind.OpMask)
+                If useIsNullOrEmpty IsNot Nothing Then
+                    Return useIsNullOrEmpty
+                End If
+            ElseIf IsOperandNullOrEmptyConstantLike(left, compareText) Then
+                Dim useIsNullOrEmpty = TryRewriteStringVersusNullOrEmptyComparisonOperator(node, right, MirrorInequalityBinaryOperator(node.OperatorKind And BinaryOperatorKind.OpMask))
+                If useIsNullOrEmpty IsNot Nothing Then
+                    Return useIsNullOrEmpty
+                End If
+            ElseIf Not compareText AndAlso (left.IsConstant OrElse right.IsConstant) Then
+                Dim maybeOptimizedExpression = TryRewriteStringVersusConstantComparisonOperator(node, left, right, node.OperatorKind And BinaryOperatorKind.OpMask)
+                If maybeOptimizedExpression IsNot Nothing Then
+                    Return maybeOptimizedExpression
+                End If
+            End If
+
             ' Rewrite as follows:
             ' Operators.CompareString(left, right, compareText)  [Operator] 0
 
@@ -706,6 +725,103 @@ Namespace Microsoft.CodeAnalysis.VisualBasic
                                                  False, node.Type)
             End If
 
+            Return result
+        End Function
+
+        Private Function TryRewriteStringVersusConstantComparisonOperator(node As BoundBinaryOperator, left As BoundExpression, right As BoundExpression, kind As BinaryOperatorKind) As BoundExpression
+            ' Order in String.CompareOrdinal:
+            ' null < "" < "\0" < the others
+            ' Order in CompareString (Option Compare Binary):
+            ' null = "" < "\0" < the others
+            ' If either is non-null-or-empty constant, we don't have to consider the behavior
+            ' CompareString treats null as an equivalent to "".
+            Select Case kind
+                Case BinaryOperatorKind.LessThan
+                Case BinaryOperatorKind.LessThanOrEqual
+                Case BinaryOperatorKind.GreaterThan
+                Case BinaryOperatorKind.GreaterThanOrEqual
+                    Dim compareOrdinalMethod As MethodSymbol = Nothing
+                    If Not TryGetWellknownMember(compareOrdinalMethod, WellKnownMember.System_String__CompareOrdinalStringString, node.Syntax, True) Then
+                        Return Nothing
+                    End If
+                    Return New BoundBinaryOperator(
+                        node.Syntax,
+                        kind,
+                        New BoundCall(node.Syntax, compareOrdinalMethod, Nothing, Nothing, ImmutableArray.Create(left, right), Nothing, compareOrdinalMethod.ReturnType),
+                        New BoundLiteral(node.Syntax, ConstantValue.Create(0), compareOrdinalMethod.ReturnType),
+                        False,
+                        node.Type
+                    )
+            End Select
+            Dim rawOperatorMethod = DirectCast(Compilation.GetSpecialTypeMember(If(kind = BinaryOperatorKind.Equals, SpecialMember.System_String__op_Equality, SpecialMember.System_String__op_Inequality)), MethodSymbol)
+            If rawOperatorMethod IsNot Nothing Then
+                Return New BoundCall(node.Syntax, rawOperatorMethod, Nothing, Nothing, ImmutableArray.Create(left, right), Nothing, rawOperatorMethod.ReturnType)
+            End If
+            Return Nothing
+        End Function
+
+        Private Shared Function MirrorInequalityBinaryOperator(kind As BinaryOperatorKind) As BinaryOperatorKind
+            Select Case kind
+                Case BinaryOperatorKind.LessThanOrEqual ' 6 => BinaryOperatorKind.GreaterThanOrEqual (7)
+                Case BinaryOperatorKind.GreaterThanOrEqual ' 7 => BinaryOperatorKind.LessThanOrEqual (6)
+                Case BinaryOperatorKind.LessThan ' 8 => BinaryOperatorKind.GreaterThan (9)
+                Case BinaryOperatorKind.GreaterThan ' 9 => BinaryOperatorKind.LessThan (8)
+                    ' Conclusion: just flip LSB
+                    Debug.Assert(kind >= 6 AndAlso kind <= 9)
+                    Debug.Assert( ' We can't use bitwise operations in Debug.Assert
+                        BinaryOperatorKind.GreaterThan - BinaryOperatorKind.LessThan = 1 AndAlso
+                        BinaryOperatorKind.GreaterThanOrEqual - BinaryOperatorKind.LessThanOrEqual = 1 AndAlso
+                        BinaryOperatorKind.LessThan - BinaryOperatorKind.LessThanOrEqual = 2 AndAlso
+                        BinaryOperatorKind.LessThanOrEqual Mod 2 = 0
+                    )
+                    Return DirectCast(kind Xor 1, BinaryOperatorKind)
+            End Select
+            Return kind ' = and <> are symmetric
+        End Function
+
+
+        Private Function IsOperandNullOrEmptyConstantLike(operand As BoundExpression, compareText As Boolean) As Boolean
+            If operand.IsConstant Then
+                Debug.Assert(operand.ConstantValueOpt.IsString)
+                Dim operandValue = operand.ConstantValueOpt.StringValue
+                If operandValue Is Nothing Then
+                    Return True
+                End If
+                ' = "" returns True for WJ (U+2060) and some other invisible characters
+                ' if Option Compare is Text
+                Return operandValue.Length = 0 AndAlso Not compareText
+            End If
+            ' hasn't considered String.Empty yet
+            Return False
+        End Function
+
+        Private Function TryRewriteStringVersusNullOrEmptyComparisonOperator(node As BoundBinaryOperator, maybeNotConstant As BoundExpression, kind As BinaryOperatorKind) As BoundExpression
+            Dim shouldFlip As Boolean = False
+            Select Case kind
+                Case BinaryOperatorKind.GreaterThanOrEqual
+                    Return EvaluateOperandAndReturnTrue(node, maybeNotConstant, True)
+                Case BinaryOperatorKind.LessThan
+                    Return EvaluateOperandAndReturnFalse(node, maybeNotConstant, True)
+                Case BinaryOperatorKind.Equals
+                Case BinaryOperatorKind.LessThanOrEqual
+                    Exit Select
+                Case BinaryOperatorKind.GreaterThan
+                Case BinaryOperatorKind.NotEquals
+                    shouldFlip = True
+                Case Else
+                    ' Must not be occurred
+                    Return Nothing
+            End Select
+            Dim isNullOrEmptyMethod As MethodSymbol = Nothing
+            If Not TryGetWellknownMember(isNullOrEmptyMethod, WellKnownMember.System_String__IsNullOrEmptyString, node.Syntax, True) Then
+                Return Nothing
+            End If
+            Dim result As BoundExpression = New BoundCall(node.Syntax, isNullOrEmptyMethod, Nothing, Nothing,
+                                       ImmutableArray.Create(maybeNotConstant), Nothing,
+                                       isNullOrEmptyMethod.ReturnType)
+            If shouldFlip Then
+                result = New BoundUnaryOperator(node.Syntax, UnaryOperatorKind.Not, result, False, isNullOrEmptyMethod.ReturnType)
+            End If
             Return result
         End Function
 
@@ -1036,6 +1152,16 @@ Namespace Microsoft.CodeAnalysis.VisualBasic
             Debug.Assert(operand.Type.IsNullableOfBoolean())
 
             Dim result = New BoundLiteral(node.Syntax, ConstantValue.False, node.Type.GetNullableUnderlyingType())
+            Return New BoundSequence(node.Syntax, ImmutableArray(Of LocalSymbol).Empty,
+                                     ImmutableArray.Create(If(operandHasValue, NullableValueOrDefault(operand), operand)),
+                                     result, result.Type)
+        End Function
+
+        Private Function EvaluateOperandAndReturnTrue(node As BoundBinaryOperator, operand As BoundExpression, operandHasValue As Boolean) As BoundExpression
+            Debug.Assert(node.Type.IsNullableOfBoolean())
+            Debug.Assert(operand.Type.IsNullableOfBoolean())
+
+            Dim result = New BoundLiteral(node.Syntax, ConstantValue.True, node.Type.GetNullableUnderlyingType())
             Return New BoundSequence(node.Syntax, ImmutableArray(Of LocalSymbol).Empty,
                                      ImmutableArray.Create(If(operandHasValue, NullableValueOrDefault(operand), operand)),
                                      result, result.Type)
