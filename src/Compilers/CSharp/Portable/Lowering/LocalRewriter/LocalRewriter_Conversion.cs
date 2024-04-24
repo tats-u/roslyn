@@ -15,6 +15,39 @@ namespace Microsoft.CodeAnalysis.CSharp
 {
     internal partial class LocalRewriter
     {
+        private bool IsTrustedHandler(BoundConversion node, InterpolatedStringHandlerData data)
+        {
+            if (data.Construction is not BoundObjectCreationExpression constructor) return false;
+            // TODO: how to trust other handlers
+            var handlerWellKnownType = constructor.Type.Name switch
+            {
+                "DefaultInterpolatedStringHandler" => WellKnownType.System_Runtime_CompilerServices_DefaultInterpolatedStringHandler,
+                _ => WellKnownType.NextAvailable,
+            };
+            if (handlerWellKnownType == WellKnownType.NextAvailable) return false;
+            var handlerType = _compilation.GetWellKnownType(handlerWellKnownType);
+            if (!TypeSymbol.Equals(constructor.Type, handlerType, TypeCompareKind.AllIgnoreOptions))
+            {
+                return false;
+            }
+            Debug.Assert(constructor.Arguments.Length >= 2);
+            if (constructor.Arguments.Length <= 1) return false;
+            // No format provider
+            if (constructor.Arguments.Length == 2) return true;
+            var formatProviderType = _compilation.GetWellKnownType(WellKnownType.System_IFormatProvider);
+            // CultureInfo is most frequently used as IFormatProvider and trustable.
+            // TODO: how to trust other IFormatProvider
+            var cultureInfoType = _compilation.GetWellKnownType(WellKnownType.System_Globalization_CultureInfo);
+            if (formatProviderType is null) return true;
+            foreach (var arg in constructor.Arguments.AsSpan()[2..])
+            {
+                if (arg is not { Type: not null }) continue;
+                var discardedUseSiteInfo = CompoundUseSiteInfo<AssemblySymbol>.Discarded;
+                if (!arg.Type.Equals(formatProviderType, TypeCompareKind.AllIgnoreOptions)) continue;
+                if (!arg.Type.Equals(cultureInfoType, TypeCompareKind.AllIgnoreOptions)) return false;
+            }
+            return true;
+        }
         public override BoundNode VisitConversion(BoundConversion node)
         {
             switch (node.ConversionKind)
@@ -31,6 +64,7 @@ namespace Microsoft.CodeAnalysis.CSharp
                         _ => throw ExceptionUtilities.UnexpectedValue(node.Operand.Kind)
                     };
 
+                    var (optimizedParts, increasedLiteralLength, filledHoleCount) = !_inExpressionLambda && IsTrustedHandler(node, data) ? OptimizeAppendFormattedCalls(parts) : (parts, 0, 0);
                     InterpolationHandlerResult interpolationResult = RewriteToInterpolatedStringHandlerPattern(data, parts, node.Operand.Syntax);
                     return interpolationResult.WithFinalResult(interpolationResult.HandlerTemp);
 
