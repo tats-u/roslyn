@@ -7,6 +7,7 @@
 using System;
 using System.Collections.Immutable;
 using System.Linq;
+using System.Runtime.Versioning;
 using Microsoft.CodeAnalysis.CSharp.Symbols;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.CSharp.Test.Utilities;
@@ -3989,6 +3990,58 @@ Caught");
   IL_007e:  ret
 }
 ");
+        }
+
+        [ConditionalFact(typeof(CoreClrOnly))]
+        public void StringCreate()
+        {
+            // FIXME: How can we do this only when .NET Core?
+            var source = @"
+using System;
+using System.Globalization;
+
+
+Console.WriteLine(string.Create(CultureInfo.InvariantCulture, $""3 / 2 = {1.5}""));
+";
+            var handlerSource = @"
+using System;
+using System.Text;
+using System.Runtime.CompilerServices;
+
+namespace System
+{
+    namespace Runtime.CompilerServices
+    {
+    
+        public ref struct DefaultInterpolatedStringHandler
+        {
+            private readonly StringBuilder _builder;
+            private readonly IFormatProvider _provider;
+            public DefaultInterpolatedStringHandler(int literalLength, int formattedCount): this(literalLength, formattedCount, CultureInfo.CurrentCulture) {}
+            public DefaultInterpolatedStringHandler(int literalLength, int formattedCount, IFormatProvider provider)
+            {
+                _builder = new StringBuilder();
+                _provider = provider;
+            }
+            public string ToStringAndClear() => _builder.ToString();
+            public void AppendLiteral(string s) => _builder.AppendLine(s);
+            public void AppendFormatted(object o) => _builder.AppendLine(""value:"" + o.ToString());
+            public void AppendFormatted(IFormattable o) => _builder.AppendLine(""value:"" + o.ToString(null, _provider));
+            
+        }
+    }
+    public static class StringExtensions
+    {
+        public static string Create(IFormatProvider provider, [InterpolatedStringHandlerArgument(nameof(provider))] ref DefaultInterpolatedStringHandler handler) =>
+            handler.ToStringAndClear();
+    }
+}
+";
+            var comp = CreateCompilation(new[] { source },
+                targetFramework: TargetFramework.NetCoreApp);
+            var verifier = CompileAndVerify(comp, verify: Verification.FailsILVerify, expectedOutput: @"
+3 / 2 = 
+value:1.5");
         }
 
         [ConditionalTheory(typeof(MonoOrCoreClrOnly), typeof(NoIOperationValidation))]

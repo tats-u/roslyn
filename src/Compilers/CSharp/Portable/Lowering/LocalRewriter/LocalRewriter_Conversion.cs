@@ -44,6 +44,8 @@ namespace Microsoft.CodeAnalysis.CSharp
                 if (arg is not { Type: not null }) continue;
                 var discardedUseSiteInfo = CompoundUseSiteInfo<AssemblySymbol>.Discarded;
                 if (!arg.Type.Equals(formatProviderType, TypeCompareKind.AllIgnoreOptions)) continue;
+                if (arg is not BoundInterpolatedStringArgumentPlaceholder boundPlaceholder) continue;
+                // FIXME: How to get the actual type other than IFormatProvider?
                 if (!arg.Type.Equals(cultureInfoType, TypeCompareKind.AllIgnoreOptions)) return false;
             }
             return true;
@@ -64,8 +66,8 @@ namespace Microsoft.CodeAnalysis.CSharp
                         _ => throw ExceptionUtilities.UnexpectedValue(node.Operand.Kind)
                     };
 
-                    var (optimizedParts, increasedLiteralLength, filledHoleCount) = !_inExpressionLambda && IsTrustedHandler(node, data) ? OptimizeAppendFormattedCalls(parts) : (parts, 0, 0);
-                    InterpolationHandlerResult interpolationResult = RewriteToInterpolatedStringHandlerPattern(data, parts, node.Operand.Syntax);
+                    var (optimizedParts, increasedLiteralLength, filledHoleCount) = !_inExpressionLambda && IsTrustedHandler(node, data) ? OptimizeAppendFormattedCalls(_factory, parts) : (parts, 0, 0);
+                    InterpolationHandlerResult interpolationResult = RewriteToInterpolatedStringHandlerPattern(data, optimizedParts, node.Operand.Syntax, increasedLiteralLength, filledHoleCount);
                     return interpolationResult.WithFinalResult(interpolationResult.HandlerTemp);
 
                 case ConversionKind.SwitchExpression:
